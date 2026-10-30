@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import math
 import hmac
 import time
 import json
@@ -53,6 +54,9 @@ app.add_middleware(
 # CATÁLOGO DINÁMICO DE URLS Y CONFIGURACIÓN GLOBAL POR DEFECTO
 # ==============================================================================
 DEFAULT_SYSTEM_CONFIGS: Dict[str, str] = {
+    "playstore_review_mode": "false",
+    "auto_trial_enabled": "true",
+    "auto_trial_days": "3",
     "enforce_apk_signature": "true",
     "enforce_device_lock": "true",
     "allowed_apk_sha256": DEFAULT_ALLOWED_CERTS,
@@ -224,6 +228,45 @@ def db_save_driver(uid: str, name: str, phone: str, valid_until: str, status: st
         """, (uid, name, phone, status, valid_until, now_iso, notes))
         conn.commit()
         conn.close()
+
+
+def db_insert_driver_if_new(uid: str, name: str, phone: str, valid_until: str, notes: str = "") -> Dict[str, Any]:
+    """
+    Inserta un nuevo conductor únicamente si su UID no existe aún (atómico contra condiciones de carrera
+    para que nunca se sobrescriba una membresía vencida o suspendida).
+    """
+    record = {
+        "uid": uid,
+        "name": name,
+        "phone": phone,
+        "status": "active",
+        "valid_until": valid_until,
+        "notes": notes
+    }
+    if USE_SUPABASE:
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/drivers?on_conflict=uid"
+            headers = supabase_headers()
+            headers["Prefer"] = "resolution=ignore-duplicates,return=representation"
+            res = requests.post(url, headers=headers, json=record, timeout=6)
+            if res.status_code in (200, 201):
+                rows = res.json() if res.text else []
+                if isinstance(rows, list) and rows:
+                    return rows[0]
+        except Exception as e:
+            print(f"[Supabase Error insert_driver_if_new] {e}")
+        return db_get_driver(uid) or record
+    else:
+        conn = get_sqlite_db()
+        cur = conn.cursor()
+        now_iso = datetime.now().isoformat()
+        cur.execute("""
+        INSERT OR IGNORE INTO drivers (uid, name, phone, status, valid_until, created_at, notes)
+        VALUES (?, ?, ?, 'active', ?, ?, ?)
+        """, (uid, name, phone, valid_until, now_iso, notes))
+        conn.commit()
+        conn.close()
+        return db_get_driver(uid) or record
 
 
 def db_delete_driver(uid: str):
@@ -690,12 +733,13 @@ def evaluate_driver_membership(uid: str) -> Tuple[bool, int, str, str, Optional[
             False,
             402,
             "expired",
-            "Tu membresía ha vencido. Renueva tu plan para descargar configuración y habilitar el sistema.",
+            "Tu membresía o prueba gratuita ha vencido. Renueva tu plan para descargar configuración y habilitar el sistema.",
             driver,
             0
         )
 
-    days_left = max(0, (valid_until_dt - now).days)
+    rem_sec = max(0.0, (valid_until_dt - now).total_seconds())
+    days_left = max(1, int(math.ceil(rem_sec / 86400.0)))
     return (
         True,
         200,
@@ -813,6 +857,8 @@ async def validate_session(request: Request):
 
     token = body_json.get("token")
     fallback_uid = str(body_json.get("uid") or "").strip()
+    req_driver_name = str(body_json.get("driver_name") or "").strip()
+    req_driver_phone = str(body_json.get("driver_phone") or "").strip()
     device_model = str(body_json.get("device_model") or "Android").strip()
     initial_state = body_json.get("initial_state")
 
@@ -820,10 +866,15 @@ async def validate_session(request: Request):
     if jwt_err in ("expired_jwt", "malformed_jwt") or (jwt_err and jwt_err.startswith("jwt_parse_error")):
         extracted_uid = None
     else:
-        extracted_uid = jwt_uid or fallback_uid
         if jwt_uid and fallback_uid and jwt_uid != fallback_uid:
-            if not db_get_driver(jwt_uid) and db_get_driver(fallback_uid):
+            if db_get_driver(jwt_uid):
+                extracted_uid = jwt_uid
+            elif db_get_driver(fallback_uid):
                 extracted_uid = fallback_uid
+            else:
+                extracted_uid = fallback_uid if fallback_uid.isdigit() else jwt_uid
+        else:
+            extracted_uid = jwt_uid or fallback_uid
 
     if sys_cfg.get("playstore_review_mode", "false").lower() == "true":
         db_log_event(extracted_uid or "reviewer", client_ip, "validate_session", "camouflaged", "Modo Revisión Play Store Activo")
@@ -852,6 +903,43 @@ async def validate_session(request: Request):
         )
 
     is_auth, http_code, reason, msg, driver, days_left = evaluate_driver_membership(extracted_uid)
+
+    # Auto-registro automático de nuevos conductores con 3 días gratis (configurable en /admin)
+    if reason == "unregistered" and driver is None:
+        auto_trial_enabled = sys_cfg.get("auto_trial_enabled", "true").lower() == "true"
+        try:
+            trial_days = max(0, int(sys_cfg.get("auto_trial_days", "3") or 3))
+        except Exception:
+            trial_days = 3
+
+        if auto_trial_enabled and trial_days > 0:
+            clean_name = req_driver_name or f"Conductor {extracted_uid}"
+            clean_phone = req_driver_phone
+            trial_until = (datetime.now() + timedelta(days=trial_days)).isoformat()
+            trial_notes = f"Prueba gratis automática ({trial_days} días) • {device_model}"
+            created_driver = db_insert_driver_if_new(
+                uid=extracted_uid,
+                name=clean_name,
+                phone=clean_phone,
+                valid_until=trial_until,
+                notes=trial_notes
+            )
+            db_log_event(
+                extracted_uid,
+                client_ip,
+                "auto_register_trial",
+                "success",
+                f"Nuevo usuario registrado automáticamente con {trial_days}d gratis ({clean_name}) • {device_model}"
+            )
+            is_auth, http_code, reason, msg, driver, days_left = evaluate_driver_membership(extracted_uid)
+            if not driver and created_driver:
+                driver = created_driver
+                is_auth = True
+                http_code = 200
+                reason = "active"
+                days_left = trial_days
+                msg = f"¡Bienvenido! Tienes {trial_days} días de prueba gratuita activa."
+
     if not is_auth or not driver:
         db_log_event(extracted_uid, client_ip, "validate_session", reason, f"{msg} | cert={cert_or_msg[:12]}")
         return JSONResponse(
@@ -1109,7 +1197,8 @@ def admin_list_drivers(request: Request, token: Optional[str] = Query(None)):
             exp = datetime.fromisoformat(raw_v)
             if exp.tzinfo is not None:
                 exp = exp.replace(tzinfo=None)
-            d["days_left"] = max(0, (exp - now).days)
+            rem_s = (exp - now).total_seconds()
+            d["days_left"] = max(1, int(math.ceil(rem_s / 86400.0))) if rem_s > 0 else 0
             d["is_active"] = (now <= exp) and (d.get("status") != "banned")
         except Exception:
             d["days_left"] = 0
@@ -1311,6 +1400,7 @@ def admin_dashboard():
                 <label>Vigencia</label>
                 <select id="newDays">
                     <option value="1">1 Día (Demo)</option>
+                    <option value="3">3 Días (Prueba)</option>
                     <option value="7">7 Días</option>
                     <option value="15">15 Días</option>
                     <option value="30" selected>30 Días (1 Mes)</option>
@@ -1351,6 +1441,17 @@ def admin_dashboard():
             <textarea id="cfgAllowedCerts" rows="2" placeholder="ada69302..."></textarea>
         </div>
         <div class="modal-form" style="margin-bottom: 12px;">
+            <div>
+                <label>Auto-Registro Gratis</label>
+                <select id="cfgAutoTrial">
+                    <option value="true">Sí (Automático al entrar)</option>
+                    <option value="false">No (Solo manual)</option>
+                </select>
+            </div>
+            <div>
+                <label>Días Gratis Iniciales</label>
+                <input type="number" id="cfgTrialDays" value="3" min="1" max="365">
+            </div>
             <div>
                 <label>Exigir Firma Oficial APK</label>
                 <select id="cfgEnforceSig">
@@ -1436,6 +1537,8 @@ def admin_dashboard():
                 document.getElementById('ttlDisplay').innerText = (settings.lease_ttl_sec || '180') + 's';
 
                 document.getElementById('cfgAllowedCerts').value = settings.allowed_apk_sha256 || '';
+                document.getElementById('cfgAutoTrial').value = settings.auto_trial_enabled || 'true';
+                document.getElementById('cfgTrialDays').value = settings.auto_trial_days || '3';
                 document.getElementById('cfgEnforceSig').value = settings.enforce_apk_signature || 'true';
                 document.getElementById('cfgEnforceDev').value = settings.enforce_device_lock || 'true';
                 document.getElementById('cfgLeaseTtl').value = settings.lease_ttl_sec || '180';
@@ -1533,6 +1636,8 @@ def admin_dashboard():
         async function saveSystemSettings() {{
             const settings = {{
                 allowed_apk_sha256: document.getElementById('cfgAllowedCerts').value,
+                auto_trial_enabled: document.getElementById('cfgAutoTrial').value,
+                auto_trial_days: document.getElementById('cfgTrialDays').value,
                 enforce_apk_signature: document.getElementById('cfgEnforceSig').value,
                 enforce_device_lock: document.getElementById('cfgEnforceDev').value,
                 lease_ttl_sec: document.getElementById('cfgLeaseTtl').value,
