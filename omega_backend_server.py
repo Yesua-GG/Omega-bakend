@@ -1262,13 +1262,39 @@ def extract_verified_jwt_uid(token: Optional[str]) -> Tuple[Optional[str], Optio
         return None, f"jwt_parse_error:{e}"
 
 
-def build_endpoints_bundle(sys_cfg: Dict[str, str]) -> Dict[str, Any]:
+def build_endpoints_bundle(sys_cfg: Dict[str, str], restricted_viewer: bool = False) -> Dict[str, Any]:
     active_countries = db_list_countries(only_active=True)
     co_row = next((c for c in active_countries if c["country_code"] == "CO"), None)
     latam_row = next((c for c in active_countries if c["country_code"] == "LATAM"), None)
 
     host_co = (co_row["api_host"] if co_row and co_row.get("api_host") else sys_cfg.get("host_co", DEFAULT_SYSTEM_CONFIGS["host_co"]))
     host_latam = (latam_row["api_host"] if latam_row and latam_row.get("api_host") else sys_cfg.get("host_latam", DEFAULT_SYSTEM_CONFIGS["host_latam"]))
+
+    if restricted_viewer:
+        viewer_countries = [{**c, "ws_host": ""} for c in active_countries]
+        return {
+            "host_co": host_co,
+            "host_latam": host_latam,
+            "host_cas": sys_cfg.get("host_cas", DEFAULT_SYSTEM_CONFIGS["host_cas"]),
+            "host_auth": sys_cfg.get("host_auth", DEFAULT_SYSTEM_CONFIGS["host_auth"]),
+            "host_messenger": sys_cfg.get("host_messenger", DEFAULT_SYSTEM_CONFIGS["host_messenger"]),
+            "ws_ssn_host": "",
+            "ws_ssn_path": "",
+            "feed_v3_path": sys_cfg.get("feed_v3_path", DEFAULT_SYSTEM_CONFIGS["feed_v3_path"]),
+            "mode_sync_path": sys_cfg.get("mode_sync_path", DEFAULT_SYSTEM_CONFIGS["mode_sync_path"]),
+            "vehicle_path": sys_cfg.get("vehicle_path", DEFAULT_SYSTEM_CONFIGS["vehicle_path"]),
+            "contractor_settings_path": sys_cfg.get("contractor_settings_path", DEFAULT_SYSTEM_CONFIGS["contractor_settings_path"]),
+            "bid_new_order_path": "",
+            "bid_courier_path": "",
+            "bid_track_path": "",
+            "detail_new_order_path": sys_cfg.get("detail_new_order_path", DEFAULT_SYSTEM_CONFIGS["detail_new_order_path"]),
+            "detail_courier_path": sys_cfg.get("detail_courier_path", DEFAULT_SYSTEM_CONFIGS["detail_courier_path"]),
+            "detail_api_courier_path": sys_cfg.get("detail_api_courier_path", DEFAULT_SYSTEM_CONFIGS["detail_api_courier_path"]),
+            "detail_v1_path": sys_cfg.get("detail_v1_path", DEFAULT_SYSTEM_CONFIGS["detail_v1_path"]),
+            "min_poll_ms": 2500,
+            "max_poll_ms": 3500,
+            "countries": viewer_countries
+        }
 
     return {
         "host_co": host_co,
@@ -1627,12 +1653,13 @@ async def validate_session(request: Request):
                 days_left = trial_days
                 msg = f"¡Bienvenido! Tienes {trial_days} días de prueba gratuita activa."
 
-    if not is_auth or not driver:
+    if reason == "banned":
         db_log_event(extracted_uid, client_ip, "validate_session", reason, f"{msg} | cert={cert_or_msg[:12]}")
         return JSONResponse(
             status_code=http_code,
             content={
                 "authorized": False,
+                "membership_active": False,
                 "engine_active": False,
                 "reason": reason,
                 "uid": extracted_uid,
@@ -1640,6 +1667,69 @@ async def validate_session(request: Request):
                 "message": msg
             }
         )
+
+    # Modo Básico Restringido (sin membresía activa: expired / unregistered / no_subscription)
+    if not is_auth or not driver:
+        if driver and req_country_code and req_country_code != (driver.get("country_code") or ""):
+            db_update_driver_country(extracted_uid, req_country_code)
+
+        if driver:
+            enforce_dev_lock = sys_cfg.get("enforce_device_lock", "true").lower() == "true"
+            dev_ok, bound_info = check_and_bind_device(extracted_uid, device_id, device_model, cert_or_msg, enforce_dev_lock)
+            if not dev_ok:
+                bound_model = bound_info.get("device_model", "otro equipo") if bound_info else "otro equipo"
+                db_log_event(extracted_uid, client_ip, "validate_session", "device_mismatch", f"Intento desde {device_model} ({device_id[:8]}), vinculado a {bound_model}")
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "authorized": False,
+                        "membership_active": False,
+                        "engine_active": False,
+                        "reason": "device_mismatch",
+                        "uid": extracted_uid,
+                        "message": f"Esta cuenta ya está vinculada a otro dispositivo ({bound_model}). Solicita liberación al administrador."
+                    }
+                )
+
+        lease_ttl = max(60, int(sys_cfg.get("lease_ttl_sec", "180") or 180))
+        heartbeat_sec = max(30, min(lease_ttl - 30, int(sys_cfg.get("heartbeat_sec", "75") or 75)))
+        lease_token = issue_lease_token(extracted_uid, device_id, cert_or_msg, lease_ttl)
+        resolved_name = (driver.get("name") if driver else req_driver_name) or "Conductor"
+        valid_until_str = driver.get("valid_until", "") if driver else ""
+
+        sealed_viewer = seal_payload_for_apk(
+            {
+                "uid": extracted_uid,
+                "driver_name": resolved_name,
+                "membership_active": False,
+                "reason": reason,
+                "days_left": 0,
+                "valid_until": valid_until_str,
+                "lease_ttl_sec": lease_ttl,
+                "heartbeat_sec": heartbeat_sec,
+                "endpoints": build_endpoints_bundle(sys_cfg, restricted_viewer=True),
+                "driver_state": {"bot_config": None, "zones": [], "zone_settings": {}},
+                "issued_at": int(time.time())
+            },
+            cert_or_msg
+        )
+
+        db_log_event(extracted_uid, client_ip, "validate_session", f"viewer_{reason}", f"Modo Básico Lectura ({reason}) • {device_model}")
+        return {
+            "authorized": True,
+            "membership_active": False,
+            "engine_active": False,
+            "reason": reason,
+            "uid": extracted_uid,
+            "driver_name": resolved_name,
+            "days_left": 0,
+            "valid_until": valid_until_str,
+            "lease_ttl_sec": lease_ttl,
+            "heartbeat_sec": heartbeat_sec,
+            "lease_token": lease_token,
+            "message": msg,
+            "sealed_payload": sealed_viewer
+        }
 
     # Si el teléfono detectó su país por GPS y cambió respecto al registrado, actualizarlo en `drivers`
     if req_country_code and req_country_code != (driver.get("country_code") or ""):
@@ -1654,6 +1744,7 @@ async def validate_session(request: Request):
             status_code=403,
             content={
                 "authorized": False,
+                "membership_active": False,
                 "engine_active": False,
                 "reason": "device_mismatch",
                 "uid": extracted_uid,
@@ -1686,11 +1777,13 @@ async def validate_session(request: Request):
         {
             "uid": extracted_uid,
             "driver_name": driver.get("name", "Conductor"),
+            "membership_active": True,
+            "reason": "active",
             "days_left": days_left,
             "valid_until": driver.get("valid_until", ""),
             "lease_ttl_sec": lease_ttl,
             "heartbeat_sec": heartbeat_sec,
-            "endpoints": build_endpoints_bundle(sys_cfg),
+            "endpoints": build_endpoints_bundle(sys_cfg, restricted_viewer=False),
             "driver_state": cloud_state,
             "issued_at": int(time.time())
         },
@@ -1700,7 +1793,9 @@ async def validate_session(request: Request):
     db_log_event(extracted_uid, client_ip, "validate_session", "success", f"OK ({days_left}d) • {device_model} • APK={cert_or_msg[:10]}")
     return {
         "authorized": True,
+        "membership_active": True,
         "engine_active": True,
+        "reason": "active",
         "uid": extracted_uid,
         "driver_name": driver.get("name", "Conductor"),
         "days_left": days_left,
@@ -1724,7 +1819,7 @@ async def session_heartbeat(request: Request):
         db_log_event("heartbeat", client_ip, "heartbeat", "tampered", f"{att_reason}: {cert_or_msg}")
         return JSONResponse(
             status_code=403,
-            content={"authorized": False, "reason": att_reason, "message": "Integridad de aplicación inválida."}
+            content={"authorized": False, "membership_active": False, "reason": att_reason, "message": "Integridad de aplicación inválida."}
         )
 
     try:
@@ -1744,16 +1839,68 @@ async def session_heartbeat(request: Request):
     if not uid:
         return JSONResponse(
             status_code=401,
-            content={"authorized": False, "reason": "unauthorized", "message": "Sesión expirada."}
+            content={"authorized": False, "membership_active": False, "reason": "unauthorized", "message": "Sesión expirada."}
         )
 
     is_auth, http_code, reason, msg, driver, days_left = evaluate_driver_membership(uid)
-    if not is_auth or not driver:
+    if reason == "banned":
         db_log_event(uid, client_ip, "heartbeat", reason, msg)
         return JSONResponse(
             status_code=http_code,
-            content={"authorized": False, "reason": reason, "uid": uid, "message": msg}
+            content={"authorized": False, "membership_active": False, "reason": reason, "uid": uid, "message": msg}
         )
+
+    if not is_auth or not driver:
+        if driver and req_country_code and req_country_code != (driver.get("country_code") or ""):
+            db_update_driver_country(uid, req_country_code)
+
+        if driver:
+            enforce_dev_lock = sys_cfg.get("enforce_device_lock", "true").lower() == "true"
+            dev_ok, _ = check_and_bind_device(uid, device_id, device_model, cert_or_msg, enforce_dev_lock)
+            if not dev_ok:
+                return JSONResponse(
+                    status_code=403,
+                    content={"authorized": False, "membership_active": False, "reason": "device_mismatch", "uid": uid, "message": "Cuenta vinculada a otro dispositivo."}
+                )
+
+        lease_ttl = max(60, int(sys_cfg.get("lease_ttl_sec", "180") or 180))
+        heartbeat_sec = max(30, min(lease_ttl - 30, int(sys_cfg.get("heartbeat_sec", "75") or 75)))
+        new_lease = issue_lease_token(uid, device_id, cert_or_msg, lease_ttl)
+        resolved_name = driver.get("name", "Conductor") if driver else "Conductor"
+        valid_until_str = driver.get("valid_until", "") if driver else ""
+
+        sealed_viewer = seal_payload_for_apk(
+            {
+                "uid": uid,
+                "driver_name": resolved_name,
+                "membership_active": False,
+                "reason": reason,
+                "days_left": 0,
+                "valid_until": valid_until_str,
+                "lease_ttl_sec": lease_ttl,
+                "heartbeat_sec": heartbeat_sec,
+                "endpoints": build_endpoints_bundle(sys_cfg, restricted_viewer=True),
+                "driver_state": {"bot_config": None, "zones": [], "zone_settings": {}},
+                "issued_at": int(time.time())
+            },
+            cert_or_msg
+        )
+
+        return {
+            "authorized": True,
+            "membership_active": False,
+            "engine_active": False,
+            "reason": reason,
+            "uid": uid,
+            "driver_name": resolved_name,
+            "days_left": 0,
+            "valid_until": valid_until_str,
+            "lease_ttl_sec": lease_ttl,
+            "heartbeat_sec": heartbeat_sec,
+            "lease_token": new_lease,
+            "message": msg,
+            "sealed_payload": sealed_viewer
+        }
 
     if req_country_code and req_country_code != (driver.get("country_code") or ""):
         db_update_driver_country(uid, req_country_code)
@@ -1763,7 +1910,7 @@ async def session_heartbeat(request: Request):
     if not dev_ok:
         return JSONResponse(
             status_code=403,
-            content={"authorized": False, "reason": "device_mismatch", "uid": uid, "message": "Membresía activa en otro dispositivo."}
+            content={"authorized": False, "membership_active": False, "reason": "device_mismatch", "uid": uid, "message": "Membresía activa en otro dispositivo."}
         )
 
     lease_ttl = max(60, int(sys_cfg.get("lease_ttl_sec", "180") or 180))
@@ -1775,11 +1922,13 @@ async def session_heartbeat(request: Request):
         {
             "uid": uid,
             "driver_name": driver.get("name", "Conductor"),
+            "membership_active": True,
+            "reason": "active",
             "days_left": days_left,
             "valid_until": driver.get("valid_until", ""),
             "lease_ttl_sec": lease_ttl,
             "heartbeat_sec": heartbeat_sec,
-            "endpoints": build_endpoints_bundle(sys_cfg),
+            "endpoints": build_endpoints_bundle(sys_cfg, restricted_viewer=False),
             "driver_state": cloud_state,
             "issued_at": int(time.time())
         },
@@ -1788,6 +1937,9 @@ async def session_heartbeat(request: Request):
 
     return {
         "authorized": True,
+        "membership_active": True,
+        "engine_active": True,
+        "reason": "active",
         "uid": uid,
         "driver_name": driver.get("name", "Conductor"),
         "days_left": days_left,
