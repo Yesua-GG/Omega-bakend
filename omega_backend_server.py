@@ -28,8 +28,8 @@ ADMIN_SECRET_KEY = os.getenv("OMEGA_ADMIN_KEY", "omega_admin_2026_secreto")
 APP_MASTER_SECRET = os.getenv("OMEGA_APP_MASTER_SECRET", "Om3g4_C0r3_S3rv3r_M4st3r_K3y_2026!#99")
 EXPECTED_PACKAGE_NAME = "com.redtools.omega"
 
-# Huella SHA-256 inicial autorizada (incluye llave local de desarrollo + llaves Play Store que agregues en /admin)
-DEFAULT_ALLOWED_CERTS = "ada693022f9b72312fba59ea63daf162e8b0b58ed4aeca8d6dfc9007288a1158"
+# Huella SHA-256 inicial autorizada (incluye llave local de desarrollo + llave oficial BoterinDriver3.jks + llaves Play Store que agregues en /admin)
+DEFAULT_ALLOWED_CERTS = "ada693022f9b72312fba59ea63daf162e8b0b58ed4aeca8d6dfc9007288a1158,1bab21e2a0e40a805c650468e8ef74f9420a8a977e7521fd22ed41aeffe11100"
 
 # Variables de Supabase (Configurables en el Dashboard de Render)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
